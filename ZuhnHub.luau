@@ -402,13 +402,29 @@ end
 task.spawn(grabPointersOnce)
 
 local function getPlayerRole(userId)
+    userId = tonumber(userId)
     if not userId then return nil, nil end
     local RS = game:GetService("ReplicatedStorage")
+    local Players = game:GetService("Players")
 
     -- 1. Game Developer / Creator
     if game.CreatorType == Enum.CreatorType.User and userId == game.CreatorId then
         return "Dev", "#FFC107"
     end
+
+    -- Realtime Player Tag Attribute check
+    local player = Players:GetPlayerByUserId(userId)
+    if player then
+        local tag = player:GetAttribute("Tag")
+        if tag == "developer" then
+            return "Dev", "#FFC107"
+        elseif tag == "moderator" then
+            return "Mod", "#00E5FF"
+        elseif tag ~= nil and tag ~= "" then
+            return "Staff", "#00E5FF"
+        end
+    end
+
     local okRoles, rolesMod = pcall(require, RS.Shared.Roles)
     if okRoles and rolesMod then
         if rolesMod.isDeveloper and rolesMod.isDeveloper(userId) then
@@ -416,6 +432,9 @@ local function getPlayerRole(userId)
         end
         if rolesMod.isModerator and rolesMod.isModerator(userId) then
             return "Mod", "#00E5FF"
+        end
+        if rolesMod.showsStaff and rolesMod.showsStaff(userId) then
+            return "Staff", "#00E5FF"
         end
         if rolesMod.isStaff and rolesMod.isStaff(userId) then
             return "Staff", "#00E5FF"
@@ -436,7 +455,7 @@ local function getPlayerRole(userId)
         return "Mod", "#00E5FF"
     end
 
-    -- 2. World Roles (Owner / Admin)
+    -- 2. World Roles (Owner / Admin) in real-time
     grabPointersOnce()
     local lock = worldTable and worldTable.lock
     if lock then
@@ -444,14 +463,12 @@ local function getPlayerRole(userId)
             return "Owner", "#50E3C2"
         end
         local okLock, areaLock = pcall(require, RS.Shared.AreaLock)
-        if okLock and areaLock then
-            if (areaLock.onList and areaLock.onList(lock, userId)) or (areaLock.hasAccess and areaLock.hasAccess(lock, userId)) then
-                return "Admin", "#A77BFF"
-            end
+        if okLock and areaLock and areaLock.onList and areaLock.onList(lock, userId) then
+            return "Admin", "#A77BFF"
         end
         if lock.access then
             for _, acc in ipairs(lock.access) do
-                if acc[1] == userId then
+                if type(acc) == "table" and acc[1] == userId then
                     return "Admin", "#A77BFF"
                 end
             end
@@ -511,23 +528,44 @@ local function sendPublicChat(text)
     end)
 end
 
-local function sendPrivateMessage(targetIgn, text)
-    task.spawn(function()
-        local payload = getVariedPayload(text)
-        local fullMsg = "/msg " .. targetIgn .. " " .. payload
-        local wc = TextChatService:FindFirstChild("WorldChannels")
-        if wc then
-            for _, ch in ipairs(wc:GetChildren()) do
-                if ch:IsA("TextChannel") then
-                    local ok = pcall(function() ch:SendAsync(fullMsg) end)
-                    if ok then return end
+local function getChatTable()
+    local chatGui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("ChatGui")
+    if not chatGui then return nil end
+    local hud = chatGui:FindFirstChild("HUD")
+    local input = hud and hud:FindFirstChild("ConsoleClip") and hud.ConsoleClip:FindFirstChild("Bar") and hud.ConsoleClip.Bar:FindFirstChild("Field") and hud.ConsoleClip.Bar.Field:FindFirstChild("Input")
+    if not input then return nil end
+    for _, conn in ipairs(getconnections(input.FocusLost)) do
+        local fn = conn.Function
+        if fn and debug.info(fn, "s"):find("ChatUI") then
+            local uvs = getupvalues(fn)
+            local sendFn = uvs[4]
+            if sendFn and type(sendFn) == "function" then
+                local tbl = debug.getupvalue(sendFn, 1)
+                if type(tbl) == "table" and tbl.onCommand and tbl.add then
+                    return tbl
                 end
             end
         end
-        local textChannels = TextChatService:FindFirstChild("TextChannels")
-        if textChannels then
-            local gen = textChannels:FindFirstChild("RBXGeneral") or textChannels:FindFirstChildWhichIsA("TextChannel")
-            if gen then pcall(function() gen:SendAsync(fullMsg) end) end
+    end
+    return nil
+end
+
+local function sendPrivateMessage(targetIgn, text)
+    task.spawn(function()
+        local payload = getVariedPayload(text)
+        local cmdArg = tostring(targetIgn) .. " " .. tostring(payload)
+
+        local okNet, Net = pcall(require, ReplicatedStorage.Shared.Net)
+        if okNet and Net and Net.call then
+            local ok, res = pcall(Net.call, "ModCommand", "msg", cmdArg)
+            if ok and type(res) == "table" and type(res.lines) == "table" then
+                local cTable = getChatTable()
+                if cTable and cTable.add then
+                    for _, line in ipairs(res.lines) do
+                        cTable.add(tostring(line))
+                    end
+                end
+            end
         end
     end)
 end
@@ -631,28 +669,6 @@ local function getInventoryItemCount(targetId)
         end
     end
     return count
-end
-
-local function getChatTable()
-    local chatGui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("ChatGui")
-    if not chatGui then return nil end
-    local hud = chatGui:FindFirstChild("HUD")
-    local input = hud and hud:FindFirstChild("ConsoleClip") and hud.ConsoleClip:FindFirstChild("Bar") and hud.ConsoleClip.Bar:FindFirstChild("Field") and hud.ConsoleClip.Bar.Field:FindFirstChild("Input")
-    if not input then return nil end
-    for _, conn in ipairs(getconnections(input.FocusLost)) do
-        local fn = conn.Function
-        if fn and debug.info(fn, "s"):find("ChatUI") then
-            local uvs = getupvalues(fn)
-            local sendFn = uvs[4]
-            if sendFn and type(sendFn) == "function" then
-                local tbl = debug.getupvalue(sendFn, 1)
-                if type(tbl) == "table" and tbl.onCommand and tbl.add then
-                    return tbl
-                end
-            end
-        end
-    end
-    return nil
 end
 
 local function handleHostDropCommand(cmdName, qty)
@@ -2038,17 +2054,30 @@ SpamBox:CreateToggle({
                     else
                         if pmTarget and pmTarget ~= "" then
                             local targetUid = nil
+                            local resolvedTarget = pmTarget
                             if othersActiveTable then
                                 for _, p in pairs(othersActiveTable) do
-                                    if type(p) == "table" and p.name and p.name:lower() == pmTarget:lower() then
-                                        targetUid = p.userId
+                                    if type(p) == "table" then
+                                        if (p.name and p.name:lower() == pmTarget:lower()) or (p.who and p.who.Name:lower() == pmTarget:lower()) then
+                                            targetUid = p.userId
+                                            resolvedTarget = p.name or (p.who and p.who.Name) or pmTarget
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            if not targetUid then
+                                for _, pl in ipairs(Players:GetPlayers()) do
+                                    if pl.Name:lower() == pmTarget:lower() or pl.DisplayName:lower() == pmTarget:lower() or (pl:GetAttribute("GameName") and tostring(pl:GetAttribute("GameName")):lower() == pmTarget:lower()) then
+                                        targetUid = pl.UserId
+                                        resolvedTarget = pl:GetAttribute("GameName") or pl.Name
                                         break
                                     end
                                 end
                             end
                             local isExempt = staffProtection and targetUid and isPlayerExempt(targetUid)
                             if not isExempt then
-                                sendPrivateMessage(pmTarget, pmText)
+                                sendPrivateMessage(resolvedTarget, pmText)
                             end
                             task.wait(delayTime)
                         elseif othersActiveTable then
