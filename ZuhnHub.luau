@@ -110,6 +110,161 @@ local hostTaxBet = 10
 local hostTaxRateLock = 70
 local hostTaxPercent = 10
 
+-- World State & Persistence variables
+local targetWarpWorld = ""
+local myWorldsList = {}
+local recentWorldsList = {}
+local RECENT_WORLDS_FILE = ASSET_DIR .. "/recent_worlds.json"
+local myWorldsContainer = nil
+local recentWorldsContainer = nil
+local lblCurrentWorldInfo = nil
+local lblLockStatusInfo = nil
+local inputTargetWorldElem = nil
+
+local queue_on_teleport = (syn and syn.queue_on_teleport) or queue_on_teleport or queueonteleport
+local teleportArmed = false
+local function armTeleportPersistence()
+    if teleportArmed or not queue_on_teleport then return end
+    teleportArmed = true
+    pcall(function()
+        queue_on_teleport([[
+            if _G.ZuhnHubLoading then return end
+            _G.ZuhnHubLoading = true
+            task.spawn(function()
+                repeat task.wait(0.5) until game:IsLoaded() and game:GetService("Players").LocalPlayer
+                task.wait(1.5)
+                local content = nil
+                if isfile and isfile("ZuhnHub.luau") then
+                    content = readfile("ZuhnHub.luau")
+                elseif isfile and isfile("zuhn-hub/ZuhnHub.luau") then
+                    content = readfile("zuhn-hub/ZuhnHub.luau")
+                end
+                if content and #content > 100 then
+                    local fn, err = loadstring(content)
+                    if fn then
+                        fn()
+                    else
+                        warn("Zuhn Hub reload error:", err)
+                    end
+                end
+                _G.ZuhnHubLoading = nil
+            end)
+        ]])
+    end)
+end
+
+pcall(function()
+    LocalPlayer.OnTeleport:Connect(function(state)
+        if state == Enum.TeleportState.Started then
+            armTeleportPersistence()
+        end
+    end)
+end)
+
+local function getMyWorldsFilePath()
+    local uid = (LocalPlayer and LocalPlayer.UserId) or 0
+    return string.format("%s/my_worlds_%s.json", ASSET_DIR, tostring(uid))
+end
+
+local function loadMyWorlds()
+    myWorldsList = {}
+    if not (readfile and isfile) then return end
+    pcall(function()
+        local path = getMyWorldsFilePath()
+        if isfile(path) then
+            local data = HttpService:JSONDecode(readfile(path))
+            if type(data) == "table" then
+                myWorldsList = data
+            end
+        end
+    end)
+end
+
+local function saveMyWorlds()
+    if not (writefile and makefolder and isfolder) then return end
+    pcall(function()
+        if not isfolder(ASSET_DIR) then pcall(makefolder, ASSET_DIR) end
+        writefile(getMyWorldsFilePath(), HttpService:JSONEncode(myWorldsList))
+    end)
+end
+
+local function addMyWorld(wName)
+    if not wName or wName == "" then return false end
+    wName = string.upper(string.gsub(wName, "[^A-Z0-9]", "")):sub(1, 24)
+    if wName == "" then return false end
+    for _, name in ipairs(myWorldsList) do
+        if name:upper() == wName then return false end
+    end
+    table.insert(myWorldsList, wName)
+    saveMyWorlds()
+    return true
+end
+
+local function removeMyWorld(wName)
+    if not wName or wName == "" then return false end
+    wName = string.upper(string.gsub(wName, "[^A-Z0-9]", "")):sub(1, 24)
+    local removed = false
+    for i = #myWorldsList, 1, -1 do
+        if myWorldsList[i]:upper() == wName then
+            table.remove(myWorldsList, i)
+            removed = true
+        end
+    end
+    if removed then saveMyWorlds() end
+    return removed
+end
+
+local function loadRecentWorlds()
+    recentWorldsList = {}
+    if readfile and isfile and isfile(RECENT_WORLDS_FILE) then
+        pcall(function()
+            local data = HttpService:JSONDecode(readfile(RECENT_WORLDS_FILE))
+            if type(data) == "table" then
+                recentWorldsList = data
+            end
+        end)
+    end
+    -- Seed from player attribute if empty
+    if #recentWorldsList == 0 then
+        local recAttr = LocalPlayer:GetAttribute("RecentWorlds") or ""
+        for w in string.gmatch(recAttr, "%S+") do
+            local clean = string.upper(string.gsub(w, "[^A-Z0-9]", "")):sub(1, 24)
+            if clean ~= "" and not table.find(recentWorldsList, clean) then
+                table.insert(recentWorldsList, clean)
+                if #recentWorldsList >= 8 then break end
+            end
+        end
+    end
+end
+
+local function saveRecentWorlds()
+    if not (writefile and makefolder and isfolder) then return end
+    pcall(function()
+        if not isfolder(ASSET_DIR) then pcall(makefolder, ASSET_DIR) end
+        writefile(RECENT_WORLDS_FILE, HttpService:JSONEncode(recentWorldsList))
+    end)
+end
+
+local function addRecentWorld(wName)
+    if not wName or wName == "" then return end
+    wName = string.upper(string.gsub(wName, "[^A-Z0-9]", "")):sub(1, 24)
+    if wName == "" then return end
+
+    for i = #recentWorldsList, 1, -1 do
+        if recentWorldsList[i]:upper() == wName then
+            table.remove(recentWorldsList, i)
+        end
+    end
+    table.insert(recentWorldsList, 1, wName)
+    while #recentWorldsList > 8 do
+        table.remove(recentWorldsList, #recentWorldsList)
+    end
+    saveRecentWorlds()
+end
+
+loadMyWorlds()
+loadRecentWorlds()
+
 _G.ZuhnHubToken = (_G.ZuhnHubToken or 0) + 1
 local loopToken = _G.ZuhnHubToken
 
@@ -758,7 +913,11 @@ local function onGemsPickedUp(amount)
     end)
 end
 
+local cachedAddGemsFn = nil
+local cachedU2 = nil
+
 local function getGemsWatcherHandle()
+    if cachedAddGemsFn and cachedU2 then return cachedAddGemsFn, cachedU2 end
     local chatGui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("ChatGui")
     if not chatGui then return nil, nil end
     local hud = chatGui:FindFirstChild("HUD")
@@ -773,7 +932,9 @@ local function getGemsWatcherHandle()
                 local tbl = debug.getupvalue(sendFn, 1)
                 if type(tbl) == "table" and tbl.addGems then
                     local u2 = debug.getupvalue(tbl.addGems, 2)
-                    return tbl.addGems, u2
+                    cachedAddGemsFn = tbl.addGems
+                    cachedU2 = u2
+                    return cachedAddGemsFn, cachedU2
                 end
             end
         end
@@ -784,19 +945,23 @@ end
 -- Passive Gems Watcher (Zero hooks, native pickup preserved 100%)
 task.spawn(function()
     while _G.ZuhnHubToken == loopToken do
-        task.wait(0.05)
-        local addGemsFn, u2 = getGemsWatcherHandle()
-        if addGemsFn then
-            local currentGems = (u2 and tonumber(u2.text)) or (debug.getupvalue(addGemsFn, 1))
-            if currentGems and type(currentGems) == "number" then
-                if lastKnownGems == nil then
-                    lastKnownGems = currentGems
-                elseif currentGems > lastKnownGems then
-                    local delta = currentGems - lastKnownGems
-                    lastKnownGems = currentGems
-                    onGemsPickedUp(delta)
-                else
-                    lastKnownGems = currentGems
+        if not hostGemsCountEnabled then
+            task.wait(0.5)
+        else
+            task.wait(0.1)
+            local addGemsFn, u2 = getGemsWatcherHandle()
+            if addGemsFn then
+                local currentGems = (u2 and tonumber(u2.text)) or (debug.getupvalue(addGemsFn, 1))
+                if currentGems and type(currentGems) == "number" then
+                    if lastKnownGems == nil then
+                        lastKnownGems = currentGems
+                    elseif currentGems > lastKnownGems then
+                        local delta = currentGems - lastKnownGems
+                        lastKnownGems = currentGems
+                        onGemsPickedUp(delta)
+                    else
+                        lastKnownGems = currentGems
+                    end
                 end
             end
         end
@@ -2107,7 +2272,518 @@ SpamBox:CreateToggle({
     end
 }, "ToggleSpamActive")
 
--- TAB 4: SETTINGS & CONFIGS
+local function warpToWorld(targetWorld)
+    if not targetWorld or targetWorld == "" then
+        pcall(function()
+            Starlight:Notification({
+                Title = "World Warp",
+                Icon = NebulaIcons:GetIcon("warning", "Material"),
+                Content = "Please enter a valid world name!"
+            }, "NotiWarpInvalid")
+        end)
+        return
+    end
+
+    targetWorld = string.gsub(string.upper(targetWorld), "[^A-Z0-9]", ""):sub(1, 24)
+    if targetWorld == "" then return end
+
+    addRecentWorld(targetWorld)
+    if refreshRecentWorldsUI then pcall(refreshRecentWorldsUI) end
+
+    armTeleportPersistence()
+
+    playSound(sfxSwooshId, 0.6)
+    pcall(function()
+        Starlight:Notification({
+            Title = "World Warp",
+            Icon = NebulaIcons:GetIcon("public", "Material"),
+            Content = "Teleporting to " .. targetWorld .. "..."
+        }, "NotiWarping")
+    end)
+
+    grabPointersOnce()
+    local handled = false
+    if worldTable and worldTable.enter then
+        local ok = pcall(worldTable.enter, targetWorld)
+        if ok then handled = true end
+    end
+
+    if not handled and getgc then
+        pcall(function()
+            for _, tbl in ipairs(getgc(true)) do
+                if type(tbl) == "table" and rawget(tbl, "raymanOn") and rawget(tbl, "enter") then
+                    worldTable = tbl
+                    pcall(tbl.enter, targetWorld)
+                    break
+                end
+            end
+        end)
+    end
+end
+
+-- TAB 6: WORLD NAVIGATOR & MY WORLDS
+local WorldTab = MainTabSection:CreateTab({
+    Name = "",
+    Icon = NebulaIcons:GetIcon("public", "Material"),
+    Columns = 1,
+}, "WorldTab")
+
+local WorldNavBox = WorldTab:CreateGroupbox({
+    Name = "World Navigator",
+    Column = 1,
+}, "WorldNavBox")
+
+-- Compact Status Card (No vertical gap)
+local statusCard = Instance.new("Frame")
+statusCard.Name = "WorldStatusCard"
+statusCard.BackgroundColor3 = Color3.fromRGB(24, 27, 33)
+statusCard.BorderSizePixel = 0
+statusCard.ZIndex = 15
+statusCard.Size = UDim2.new(1, 0, 0, 48)
+statusCard.Parent = WorldNavBox.ParentingItem
+
+local scCorner = Instance.new("UICorner")
+scCorner.CornerRadius = UDim.new(0, 6)
+scCorner.Parent = statusCard
+
+local scStroke = Instance.new("UIStroke")
+scStroke.Color = Color3.fromRGB(48, 54, 66)
+scStroke.Thickness = 1
+scStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+scStroke.Parent = statusCard
+
+local scLayout = Instance.new("UIListLayout")
+scLayout.FillDirection = Enum.FillDirection.Vertical
+scLayout.SortOrder = Enum.SortOrder.LayoutOrder
+scLayout.Padding = UDim.new(0, 2)
+scLayout.Parent = statusCard
+
+local scPadding = Instance.new("UIPadding")
+scPadding.PaddingLeft = UDim.new(0, 10)
+scPadding.PaddingRight = UDim.new(0, 10)
+scPadding.PaddingTop = UDim.new(0, 6)
+scPadding.PaddingBottom = UDim.new(0, 6)
+scPadding.Parent = statusCard
+
+local lblCurWorld = Instance.new("TextLabel")
+lblCurWorld.Name = "CurrentWorldLabel"
+lblCurWorld.BackgroundTransparency = 1
+lblCurWorld.ZIndex = 16
+lblCurWorld.Size = UDim2.new(1, 0, 0, 18)
+lblCurWorld.Font = Enum.Font.GothamMedium
+lblCurWorld.RichText = true
+lblCurWorld.Text = '<font color="#94A3B8">Current World:</font> <font color="#FFFFFF"><b>Scanning...</b></font>'
+lblCurWorld.TextColor3 = Color3.fromRGB(255, 255, 255)
+lblCurWorld.TextSize = 13
+lblCurWorld.TextXAlignment = Enum.TextXAlignment.Left
+lblCurWorld.Parent = statusCard
+lblCurrentWorldInfo = lblCurWorld
+
+local lblLock = Instance.new("TextLabel")
+lblLock.Name = "LockStatusLabel"
+lblLock.BackgroundTransparency = 1
+lblLock.ZIndex = 16
+lblLock.Size = UDim2.new(1, 0, 0, 16)
+lblLock.Font = Enum.Font.Gotham
+lblLock.RichText = true
+lblLock.Text = '<font color="#94A3B8">Lock Status:</font> <font color="#CBD5E1">Checking...</font>'
+lblLock.TextColor3 = Color3.fromRGB(203, 213, 225)
+lblLock.TextSize = 11
+lblLock.TextXAlignment = Enum.TextXAlignment.Left
+lblLock.Parent = statusCard
+lblLockStatusInfo = lblLock
+
+WorldNavBox:CreateDivider()
+
+inputTargetWorldElem = WorldNavBox:CreateInput({
+    Name = "Target World Name",
+    PlaceholderText = "Enter world name... (e.g. START, ZUHN)",
+    CurrentValue = "",
+    Numeric = false,
+    Enter = true,
+    Callback = function(val)
+        targetWarpWorld = val
+        if val and val ~= "" then
+            warpToWorld(val)
+        end
+    end
+}, "InputTargetWorld")
+
+WorldNavBox:CreateButton({
+    Name = "Warp to World",
+    Icon = NebulaIcons:GetIcon("public", "Material"),
+    Callback = function()
+        warpToWorld(targetWarpWorld)
+    end
+}, "BtnWarpWorld")
+
+WorldNavBox:CreateDivider()
+
+WorldNavBox:CreateLabel({
+    Name = "Recently Visited Worlds:"
+}, "LblRecentWorldsHeader")
+
+local recentContainer = Instance.new("Frame")
+recentContainer.Name = "RecentWorldsContainer"
+recentContainer.BackgroundTransparency = 1
+recentContainer.BorderSizePixel = 0
+recentContainer.ZIndex = 15
+recentContainer.Size = UDim2.new(1, 0, 0, 0)
+recentContainer.AutomaticSize = Enum.AutomaticSize.Y
+recentContainer.Parent = WorldNavBox.ParentingItem
+recentWorldsContainer = recentContainer
+
+local recentLayout = Instance.new("UIGridLayout")
+recentLayout.CellSize = UDim2.new(0, 115, 0, 32)
+recentLayout.CellPadding = UDim2.new(0, 6, 0, 6)
+recentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+recentLayout.Parent = recentContainer
+
+local function refreshRecentWorldsUI()
+    if not recentWorldsContainer then return end
+    recentWorldsContainer:ClearAllChildren()
+    recentLayout:Clone().Parent = recentWorldsContainer
+
+    if #recentWorldsList == 0 and worldTable and worldTable.name and worldTable.name ~= "" then
+        addRecentWorld(worldTable.name)
+    end
+
+    if #recentWorldsList == 0 then
+        local lblNone = Instance.new("TextLabel")
+        lblNone.Name = "NoneLabel"
+        lblNone.BackgroundTransparency = 1
+        lblNone.Size = UDim2.new(1, 0, 0, 24)
+        lblNone.Font = Enum.Font.Gotham
+        lblNone.Text = "No recent worlds recorded yet."
+        lblNone.TextColor3 = Color3.fromRGB(150, 150, 150)
+        lblNone.TextSize = 11
+        lblNone.TextXAlignment = Enum.TextXAlignment.Center
+        lblNone.Parent = recentWorldsContainer
+        return
+    end
+
+    for idx, wName in ipairs(recentWorldsList) do
+        if idx > 8 then break end
+        local btn = Instance.new("TextButton")
+        btn.Name = "RecentBtn_" .. wName
+        btn.LayoutOrder = idx
+        btn.BackgroundColor3 = Color3.fromRGB(24, 27, 34)
+        btn.BorderSizePixel = 0
+        btn.ZIndex = 16
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.Font = Enum.Font.GothamBold
+        btn.Text = wName
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 11
+        btn.TextXAlignment = Enum.TextXAlignment.Center
+        btn.TextYAlignment = Enum.TextYAlignment.Center
+        btn.AutoButtonColor = false
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = btn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(52, 58, 70)
+        stroke.Thickness = 1
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.Parent = btn
+
+        btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(36, 42, 54) }):Play()
+            TweenService:Create(stroke, TweenInfo.new(0.15), { Color = Color3.fromRGB(90, 105, 130) }):Play()
+        end)
+        btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(24, 27, 34) }):Play()
+            TweenService:Create(stroke, TweenInfo.new(0.15), { Color = Color3.fromRGB(52, 58, 70) }):Play()
+        end)
+
+        btn.MouseButton1Click:Connect(function()
+            targetWarpWorld = wName
+            if inputTargetWorldElem and inputTargetWorldElem.Set then
+                pcall(function() inputTargetWorldElem:Set({ CurrentValue = wName }) end)
+            end
+            warpToWorld(wName)
+        end)
+
+        btn.Parent = recentWorldsContainer
+    end
+end
+
+-- GROUPBOX 2: MY WORLDS (Auto-detected World Locked worlds)
+local MyWorldsBox = WorldTab:CreateGroupbox({
+    Name = "My Worlds (World Locked)",
+    Column = 1,
+}, "MyWorldsBox")
+
+local function syncCurrentWorldOwnership()
+    grabPointersOnce()
+    if not worldTable or not worldTable.name or worldTable.name == "" then return end
+    local cur = string.upper(string.gsub(worldTable.name, "[^A-Z0-9]", "")):sub(1, 24)
+    if cur == "" then return end
+
+    local isOwned = (worldTable.lock and worldTable.lock.owner == LocalPlayer.UserId)
+    local inList = false
+    for _, w in ipairs(myWorldsList) do
+        if w:upper() == cur then
+            inList = true
+            break
+        end
+    end
+
+    if isOwned and not inList then
+        addMyWorld(cur)
+        if refreshMyWorldsUI then pcall(refreshMyWorldsUI) end
+    elseif not isOwned and inList then
+        removeMyWorld(cur)
+        if refreshMyWorldsUI then pcall(refreshMyWorldsUI) end
+    end
+end
+
+MyWorldsBox:CreateButton({
+    Name = "Save Current World to My Worlds",
+    Icon = NebulaIcons:GetIcon("check_circle_outline", "Material"),
+    Callback = function()
+        grabPointersOnce()
+        local curName = (worldTable and worldTable.name) or ""
+        if curName == "" then
+            Starlight:Notification({
+                Title = "My Worlds",
+                Icon = NebulaIcons:GetIcon("warning", "Material"),
+                Content = "Could not detect current world name!"
+            }, "NotiSaveCurFailed")
+            return
+        end
+
+        local isOwned = (worldTable and worldTable.lock and worldTable.lock.owner == LocalPlayer.UserId)
+        if addMyWorld(curName) then
+            pcall(refreshMyWorldsUI)
+            Starlight:Notification({
+                Title = "My Worlds",
+                Icon = NebulaIcons:GetIcon("check_circle_outline", "Material"),
+                Content = isOwned and ("Saved " .. curName .. " (Verified World Lock owned)!") or ("Saved " .. curName .. " to My Worlds!")
+            }, "NotiSaveCurSuccess")
+        else
+            Starlight:Notification({
+                Title = "My Worlds",
+                Icon = NebulaIcons:GetIcon("check_circle_outline", "Material"),
+                Content = curName .. " is already in your My Worlds list!"
+            }, "NotiSaveCurExists")
+        end
+    end
+}, "BtnSaveCurrentWorld")
+
+MyWorldsBox:CreateButton({
+    Name = "Refresh Worlds List",
+    Icon = NebulaIcons:GetIcon("refresh", "Material"),
+    Callback = function()
+        pcall(syncCurrentWorldOwnership)
+        pcall(refreshMyWorldsUI)
+        pcall(refreshRecentWorldsUI)
+        pcall(updateWorldInfoLabels)
+        Starlight:Notification({
+            Title = "My Worlds",
+            Icon = NebulaIcons:GetIcon("refresh", "Material"),
+            Content = "Worlds list updated!"
+        }, "NotiRefreshMyWorlds")
+    end
+}, "BtnRefreshMyWorlds")
+
+MyWorldsBox:CreateDivider()
+
+local myWorldsListFrame = Instance.new("Frame")
+myWorldsListFrame.Name = "MyWorldsListContainer"
+myWorldsListFrame.BackgroundTransparency = 1
+myWorldsListFrame.BorderSizePixel = 0
+myWorldsListFrame.ZIndex = 15
+myWorldsListFrame.Size = UDim2.new(1, 0, 0, 0)
+myWorldsListFrame.AutomaticSize = Enum.AutomaticSize.Y
+myWorldsListFrame.Parent = MyWorldsBox.ParentingItem
+myWorldsContainer = myWorldsListFrame
+
+local myWorldsLayout = Instance.new("UIListLayout")
+myWorldsLayout.FillDirection = Enum.FillDirection.Vertical
+myWorldsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+myWorldsLayout.Padding = UDim.new(0, 6)
+myWorldsLayout.Parent = myWorldsListFrame
+
+function refreshMyWorldsUI()
+    if not myWorldsContainer then return end
+    myWorldsContainer:ClearAllChildren()
+    myWorldsLayout:Clone().Parent = myWorldsContainer
+
+    if #myWorldsList == 0 then
+        local emptyLbl = Instance.new("TextLabel")
+        emptyLbl.Name = "EmptyLabel"
+        emptyLbl.BackgroundTransparency = 1
+        emptyLbl.Size = UDim2.new(1, 0, 0, 36)
+        emptyLbl.Font = Enum.Font.Gotham
+        emptyLbl.Text = "No saved worlds yet.\nWorlds you place a World Lock on will auto-appear here!"
+        emptyLbl.TextColor3 = Color3.fromRGB(150, 150, 150)
+        emptyLbl.TextSize = 11
+        emptyLbl.TextXAlignment = Enum.TextXAlignment.Center
+        emptyLbl.Parent = myWorldsContainer
+        return
+    end
+
+    for idx, wName in ipairs(myWorldsList) do
+        local card = Instance.new("Frame")
+        card.Name = "WorldCard_" .. wName
+        card.LayoutOrder = idx
+        card.BackgroundColor3 = Color3.fromRGB(24, 27, 33)
+        card.BorderSizePixel = 0
+        card.ZIndex = 16
+        card.Size = UDim2.new(1, 0, 0, 42)
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = card
+
+        local icon = Instance.new("ImageLabel")
+        icon.Name = "WorldIcon"
+        icon.BackgroundTransparency = 1
+        icon.ZIndex = 17
+        icon.Position = UDim2.new(0, 10, 0.5, -9)
+        icon.Size = UDim2.new(0, 18, 0, 18)
+        icon.Image = "rbxassetid://6031075931"
+        icon.ImageColor3 = Color3.fromRGB(56, 189, 248)
+        icon.Parent = card
+
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Name = "WorldName"
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.ZIndex = 17
+        nameLbl.Position = UDim2.new(0, 36, 0, 4)
+        nameLbl.Size = UDim2.new(1, -150, 0, 18)
+        nameLbl.Font = Enum.Font.GothamBold
+        nameLbl.Text = wName
+        nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        nameLbl.TextSize = 13
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.Parent = card
+
+        local subLbl = Instance.new("TextLabel")
+        subLbl.Name = "WorldSub"
+        subLbl.BackgroundTransparency = 1
+        subLbl.ZIndex = 17
+        subLbl.Position = UDim2.new(0, 36, 0, 22)
+        subLbl.Size = UDim2.new(1, -150, 0, 14)
+        subLbl.Font = Enum.Font.Gotham
+        subLbl.Text = "Owned World (World Lock)"
+        subLbl.TextColor3 = Color3.fromRGB(148, 163, 184)
+        subLbl.TextSize = 10
+        subLbl.TextXAlignment = Enum.TextXAlignment.Left
+        subLbl.Parent = card
+
+        -- Action Buttons (Warp + Delete)
+        local btnWarp = Instance.new("TextButton")
+        btnWarp.Name = "BtnWarp"
+        btnWarp.BackgroundColor3 = Color3.fromRGB(33, 36, 42)
+        btnWarp.BorderSizePixel = 0
+        btnWarp.ZIndex = 18
+        btnWarp.Position = UDim2.new(1, -95, 0.5, -13)
+        btnWarp.Size = UDim2.new(0, 52, 0, 26)
+        btnWarp.Font = Enum.Font.GothamMedium
+        btnWarp.Text = "Warp"
+        btnWarp.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btnWarp.TextSize = 11
+        btnWarp.AutoButtonColor = false
+
+        local wCorner = Instance.new("UICorner")
+        wCorner.CornerRadius = UDim.new(0, 5)
+        wCorner.Parent = btnWarp
+
+        btnWarp.MouseEnter:Connect(function()
+            TweenService:Create(btnWarp, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(2, 132, 199) }):Play()
+        end)
+        btnWarp.MouseLeave:Connect(function()
+            TweenService:Create(btnWarp, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(33, 36, 42) }):Play()
+        end)
+        btnWarp.MouseButton1Click:Connect(function()
+            targetWarpWorld = wName
+            if inputTargetWorldElem and inputTargetWorldElem.Set then
+                pcall(function() inputTargetWorldElem:Set({ CurrentValue = wName }) end)
+            end
+            warpToWorld(wName)
+        end)
+        btnWarp.Parent = card
+
+        local btnDel = Instance.new("TextButton")
+        btnDel.Name = "BtnDelete"
+        btnDel.BackgroundColor3 = Color3.fromRGB(33, 36, 42)
+        btnDel.BorderSizePixel = 0
+        btnDel.ZIndex = 18
+        btnDel.Position = UDim2.new(1, -38, 0.5, -13)
+        btnDel.Size = UDim2.new(0, 28, 0, 26)
+        btnDel.Font = Enum.Font.GothamBold
+        btnDel.Text = "X"
+        btnDel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btnDel.TextSize = 11
+        btnDel.AutoButtonColor = false
+
+        local dCorner = Instance.new("UICorner")
+        dCorner.CornerRadius = UDim.new(0, 5)
+        dCorner.Parent = btnDel
+
+        btnDel.MouseEnter:Connect(function()
+            TweenService:Create(btnDel, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(225, 29, 72) }):Play()
+        end)
+        btnDel.MouseLeave:Connect(function()
+            TweenService:Create(btnDel, TweenInfo.new(0.15), { BackgroundColor3 = Color3.fromRGB(33, 36, 42) }):Play()
+        end)
+        btnDel.MouseButton1Click:Connect(function()
+            removeMyWorld(wName)
+            refreshMyWorldsUI()
+        end)
+        btnDel.Parent = card
+
+        card.Parent = myWorldsContainer
+    end
+end
+
+function updateWorldInfoLabels()
+    grabPointersOnce()
+    local curName = (worldTable and worldTable.name) or "Unknown"
+    local isOwned = (worldTable and worldTable.lock and worldTable.lock.owner == LocalPlayer.UserId)
+    
+    if lblCurrentWorldInfo then
+        lblCurrentWorldInfo.Text = string.format('<font color="#94A3B8">Current World:</font> <font color="#FFFFFF"><b>%s</b></font>', curName)
+    end
+    
+    if lblLockStatusInfo then
+        local lockText = '<font color="#94A3B8">Lock Status:</font> <font color="#64748B">Unlocked / Public</font>'
+        if isOwned then
+            lockText = '<font color="#94A3B8">Lock Status:</font> <font color="#4ADE80"><b>Owned by You</b></font>'
+        elseif worldTable and worldTable.lock then
+            local owner = tostring(worldTable.lock.ownerName or worldTable.ownerName or "Someone")
+            lockText = string.format('<font color="#94A3B8">Lock Status:</font> <font color="#38BDF8"><b>Locked by %s</b></font>', owner)
+        end
+        lblLockStatusInfo.Text = lockText
+    end
+end
+
+-- Passive LockChanged connection for instant reaction
+pcall(function()
+    local wr = ReplicatedStorage:FindFirstChild("WorldRemotes")
+    if wr and wr:FindFirstChild("LockChanged") then
+        wr.LockChanged.OnClientEvent:Connect(function()
+            task.wait(0.15)
+            pcall(syncCurrentWorldOwnership)
+            pcall(updateWorldInfoLabels)
+        end)
+    end
+end)
+
+-- Background monitor for World Lock realtime sync and label updates
+task.spawn(function()
+    while _G.ZuhnHubToken == loopToken do
+        task.wait(1.0)
+        pcall(syncCurrentWorldOwnership)
+        pcall(updateWorldInfoLabels)
+    end
+end)
+
+-- TAB 7: SETTINGS & CONFIGS
 local SettingsTab = MainTabSection:CreateTab({
     Name = "",
     Icon = NebulaIcons:GetIcon("settings", "Material"),
@@ -2226,12 +2902,17 @@ task.spawn(function()
                     end
                 end)
 
-                -- 5. Clean navigation tab icons
+                -- 5. Clean navigation tab icons & enable scrolling if overflow
                 pcall(function()
                     local nav = sidebar:FindFirstChild("Navigation")
                     if nav then
                         nav.Position = UDim2.new(0, 0, 0, 52)
                         nav.Size = UDim2.new(1, 0, 1, -98)
+                        nav.ScrollingDirection = Enum.ScrollingDirection.Y
+                        nav.ScrollBarThickness = 2
+                        nav.ScrollBarImageTransparency = 0.5
+                        nav.CanvasSize = UDim2.new(0, 0, 0, 0)
+                        nav.AutomaticCanvasSize = Enum.AutomaticSize.Y
                         for _, section in ipairs(nav:GetChildren()) do
                             if section:IsA("Frame") then
                                 for _, btn in ipairs(section:GetChildren()) do
@@ -2260,6 +2941,9 @@ task.spawn(function()
     task.wait(0.5)
     pcall(refreshPlayersUI)
     pcall(refreshInventoryUI)
+    pcall(refreshRecentWorldsUI)
+    pcall(refreshMyWorldsUI)
+    pcall(updateWorldInfoLabels)
 end)
 
 Starlight:LoadAutoloadConfig()
